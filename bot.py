@@ -82,7 +82,12 @@ def make_id(text: str) -> str:
 # ──────────────────────────────────────────────
 def find_keywords(text: str) -> list:
     low = text.lower()
-    return [kw for kw in KEYWORDS if kw in low]
+    hits = []
+    for kw in KEYWORDS:
+        # Use regex word boundaries (\b) so 'war' doesn't match 'warrior'
+        if re.search(rf"\b{re.escape(kw)}\b", low):
+            hits.append(kw)
+    return hits
 
 def strip_html(html: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
