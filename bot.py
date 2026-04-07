@@ -113,8 +113,10 @@ BROWSER_HEADERS = {
 def fetch_truthsocial_api() -> list[dict]:
     url = f"https://truthsocial.com/api/v1/accounts/{TRUMP_ACCOUNT_ID}/statuses?exclude_replies=true&limit=20"
     
-    # SB(uc=True) spins up a stealthy undetected Chrome session
-    with SB(uc=True, headless=True) as sb:
+    # We remove headless=True so Chrome runs 'headed'. 
+    # Because you are using xvfb-run on Github Actions, it renders in a fake virtual display. 
+    # This completely circumvents Turnstile's headless detection!
+    with SB(uc=True) as sb:
         # Step 1: Open the main domain so Cloudflare evaluates your browser & sets the cf_clearance cookie
         sb.uc_open_with_reconnect("https://truthsocial.com/", 3)
         sb.sleep(3) # Give Turnstile 3 seconds to resolve the transparent math captcha
