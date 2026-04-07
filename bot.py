@@ -118,8 +118,13 @@ def fetch_truthsocial_api() -> list[dict]:
     # This completely circumvents Turnstile's headless detection!
     with SB(uc=True) as sb:
         # Step 1: Open the main domain so Cloudflare evaluates your browser & sets the cf_clearance cookie
-        sb.uc_open_with_reconnect("https://truthsocial.com/", 3)
-        sb.sleep(3) # Give Turnstile 3 seconds to resolve the transparent math captcha
+        try:
+            sb.uc_open_with_reconnect("https://truthsocial.com/", 3)
+            sb.uc_gui_click_captcha() # Explicitly solve Datacenter IP captchas!
+        except Exception:
+            pass
+        sb.sleep(3) # Give Turnstile 3 seconds to resolve
+        
         
         # Step 2: Open the actual API endpoint
         sb.uc_open_with_reconnect(url, 3)
@@ -153,11 +158,17 @@ def fetch_truthsocial_api() -> list[dict]:
 # Source 2 — trumpstruth.org (fallback)
 # ──────────────────────────────────────────────
 def fetch_trumpstruth() -> list[dict]:
-    # Use cloudscraper for trumpstruth.org as it's proven to bypass their specific protections
-    scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True})
-    r = scraper.get("https://www.trumpstruth.org/", timeout=20)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+    # Use SeleniumBase for the fallback as well, since Cloudscraper gets blocked on GitHub runner Microsoft IPs
+    with SB(uc=True) as sb:
+        try:
+            sb.uc_open_with_reconnect("https://www.trumpstruth.org/", 3)
+            sb.uc_gui_click_captcha()
+        except Exception:
+            pass
+        sb.sleep(3)
+        html = sb.get_page_source()
+        
+    soup = BeautifulSoup(html, "html.parser")
 
     posts = []
     seen_ids: set = set()
