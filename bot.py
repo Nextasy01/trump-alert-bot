@@ -2,11 +2,12 @@
 """
 Trump Truth Social → Telegram Alert Bot (v3)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Uses curl_cffi to impersonate Chrome's TLS fingerprint for Truth Social,
-and cloudscraper to bypass Cloudflare's bot detection on trumpstruth.org.
+Primary source is the trumpstruth.org RSS feed (plain XML, fetched with
+curl_cffi's Chrome TLS fingerprint). SeleniumBase browser automation against
+truthsocial.com and trumpstruth.org remains as a fallback.
 
 Requirements:
-    pip install curl-cffi beautifulsoup4 python-dotenv cloudscraper
+    pip install curl-cffi beautifulsoup4 python-dotenv seleniumbase
 
 Setup:
     1. cp .env.example .env  → fill in your Telegram credentials
@@ -14,6 +15,9 @@ Setup:
 """
 
 import os, re, json, time, hashlib, logging
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from bs4 import BeautifulSoup
 from seleniumbase import SB
@@ -21,8 +25,6 @@ from dotenv import load_dotenv
 
 # curl_cffi replaces `requests` and spoofs Chrome's TLS fingerprint
 from curl_cffi import requests
-# cloudscraper bypasses Cloudflare JS challenges
-import cloudscraper
 # ──────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────
@@ -32,6 +34,16 @@ BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID")
 POLL_EVERY = int(os.getenv("POLL_SECONDS", "90"))
 SEEN_FILE  = Path("seen_posts.json")
+STATE_FILE = Path("bot_state.json")
+
+# Don't alert on posts older than this — prevents a flood of stale alerts
+# when a source comes back after an outage (they're still marked as seen).
+MAX_ALERT_AGE = timedelta(hours=24)
+
+# Dead-man switch: warn via Telegram after this many consecutive
+# all-sources-failed runs, then repeat the warning periodically.
+FAIL_ALERT_THRESHOLD = 15
+FAIL_ALERT_REPEAT    = 500
 
 # Trump's internal Truth Social account ID (permanent)
 TRUMP_ACCOUNT_ID = "107780257626128497"
@@ -72,7 +84,20 @@ def load_seen() -> set:
     return set()
 
 def save_seen(seen: set):
-    SEEN_FILE.write_text(json.dumps(list(seen)))
+    # Sorted so the file only changes when the set actually changes —
+    # otherwise set iteration order produces a spurious git commit every run.
+    SEEN_FILE.write_text(json.dumps(sorted(seen)))
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except json.JSONDecodeError:
+            pass
+    return {"consecutive_failures": 0}
+
+def save_state(state: dict):
+    STATE_FILE.write_text(json.dumps(state, sort_keys=True))
 
 def make_id(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:20]
@@ -92,10 +117,32 @@ def find_keywords(text: str) -> list:
 def strip_html(html: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
 
+def parse_post_date(raw: str):
+    """Parse an RFC-822 (RSS) or ISO-8601 (Truth Social API) date. None if unknown."""
+    if not raw:
+        return None
+    try:
+        return parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+def is_fresh(post: dict) -> bool:
+    """True if the post is recent enough to alert on (unknown date = fresh)."""
+    dt = parse_post_date(post.get("date", ""))
+    if dt is None:
+        return True
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - dt <= MAX_ALERT_AGE
+
 # ──────────────────────────────────────────────
 # Sessions
 # ──────────────────────────────────────────────
-# Session 1: curl_cffi for primary Truth Social API
+# curl_cffi session with Chrome TLS fingerprint, used for the RSS feed
 session = requests.Session(impersonate="chrome")
 
 BROWSER_HEADERS = {
@@ -113,7 +160,55 @@ BROWSER_HEADERS = {
 
 
 # ──────────────────────────────────────────────
-# Source 1 — Truth Social internal API (primary)
+# Source 1 — trumpstruth.org RSS feed (primary)
+# ──────────────────────────────────────────────
+def fetch_trumpstruth_rss() -> list[dict]:
+    """Plain-XML feed with the full text of every post. No JS challenge,
+    no browser needed — curl_cffi's Chrome TLS fingerprint is enough."""
+    url = "https://www.trumpstruth.org/feed"
+    resp = session.get(url, headers=BROWSER_HEADERS, timeout=30)
+    if resp.status_code != 200:
+        log.warning(f"RSS feed returned HTTP {resp.status_code}: {resp.text[:200]!r}")
+        return []
+
+    try:
+        root = ET.fromstring(resp.content)
+    except ET.ParseError as e:
+        log.warning(f"RSS feed is not valid XML ({e}); body starts: {resp.text[:200]!r}")
+        return []
+
+    posts = []
+    for item in root.iter("item"):
+        link  = (item.findtext("link") or "").strip()
+        desc  = item.findtext("description") or ""
+        title = item.findtext("title") or ""
+        text  = strip_html(desc) or strip_html(title)
+        if not text:
+            continue
+
+        # Retruths are prefixed "RT: <truthsocial url>" — strip it from the
+        # text and use that URL as the link to the original post.
+        rt = re.match(r"RT:\s*(https?://truthsocial\.com/\S+)\s*", text)
+        if rt:
+            link = rt.group(1)
+            text = text[rt.end():].strip()
+        if not text:
+            continue
+
+        m = re.search(r"/statuses/(\d+)", link)
+        pid = f"trumpstruth-{m.group(1)}" if m else make_id(text[:150])
+
+        posts.append({
+            "id":   pid,
+            "text": text[:2000],
+            "url":  link or "https://truthsocial.com/@realDonaldTrump",
+            "date": (item.findtext("pubDate") or "").strip(),
+        })
+    return posts
+
+
+# ──────────────────────────────────────────────
+# Source 2 — Truth Social internal API (fallback)
 # ──────────────────────────────────────────────
 def fetch_truthsocial_api() -> list[dict]:
     url = f"https://truthsocial.com/api/v1/accounts/{TRUMP_ACCOUNT_ID}/statuses?exclude_replies=true&limit=20"
@@ -139,6 +234,8 @@ def fetch_truthsocial_api() -> list[dict]:
         try:
             items = json.loads(page_source)
         except json.JSONDecodeError:
+            log.warning(f"Truth Social API did not return JSON (likely a Cloudflare "
+                        f"challenge page); body starts: {page_source[:200]!r}")
             items = []
     posts = []
     for item in items:
@@ -157,10 +254,7 @@ def fetch_truthsocial_api() -> list[dict]:
 
 
 # ──────────────────────────────────────────────
-# Source 2 — trumpstruth.org (fallback)
-# ──────────────────────────────────────────────
-# ──────────────────────────────────────────────
-# Source 2 — trumpstruth.org (fallback)
+# Source 3 — trumpstruth.org HTML scrape (fallback)
 # ──────────────────────────────────────────────
 def fetch_trumpstruth() -> list[dict]:
     # Use SeleniumBase for the fallback as well, since Cloudscraper gets blocked on GitHub runner Microsoft IPs
@@ -178,7 +272,12 @@ def fetch_trumpstruth() -> list[dict]:
     posts = []
     seen_ids: set = set()
 
-    for anchor in soup.find_all("a", string=re.compile(r"Original Post", re.I)):
+    anchors = soup.find_all("a", string=re.compile(r"Original Post", re.I))
+    if not anchors:
+        log.warning(f"trumpstruth.org page has no 'Original Post' anchors (likely a "
+                    f"Cloudflare challenge page); body starts: {soup.get_text(' ', strip=True)[:200]!r}")
+
+    for anchor in anchors:
         try:
             block = anchor.find_parent(["div", "article", "section", "li"])
             if not block:
@@ -215,8 +314,9 @@ def fetch_trumpstruth() -> list[dict]:
 # Dispatcher
 # ──────────────────────────────────────────────
 SOURCES = [
-    ("Truth Social API (curl_cffi)", fetch_truthsocial_api),
-    ("trumpstruth.org (cloudscraper)", fetch_trumpstruth),
+    ("trumpstruth.org RSS feed", fetch_trumpstruth_rss),
+    ("Truth Social API (SeleniumBase)", fetch_truthsocial_api),
+    ("trumpstruth.org HTML scrape (SeleniumBase)", fetch_trumpstruth),
 ]
 
 def fetch_posts() -> list[dict]:
@@ -286,11 +386,24 @@ def run():
     log.info("🤖 Trump Alert Bot v3 started (GitHub Actions Mode)")
     log.info(f"   Keywords: {len(KEYWORDS)}")
 
-    seen = load_seen()
+    seen  = load_seen()
+    state = load_state()
 
     try:
         posts     = fetch_posts()
         new_alerts = 0
+
+        if posts:
+            state["consecutive_failures"] = 0
+        else:
+            state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+            fails = state["consecutive_failures"]
+            if fails == FAIL_ALERT_THRESHOLD or (fails > 0 and fails % FAIL_ALERT_REPEAT == 0):
+                send_telegram(
+                    f"⚠️ <b>TRUMP ALERT BOT — DEAD MAN SWITCH</b>\n\n"
+                    f"All sources have failed {fails} runs in a row. "
+                    f"The bot is NOT monitoring posts. Check the GitHub Actions logs."
+                )
 
         for post in posts:
             pid = post["id"]
@@ -299,14 +412,18 @@ def run():
 
             hits = find_keywords(post["text"])
             if hits:
-                log.info(f"🎯 MATCH → {hits}")
-                log.info(f"   {post['text'][:100]}…")
-                send_telegram(format_alert(post, hits))
-                new_alerts += 1
+                if is_fresh(post):
+                    log.info(f"🎯 MATCH → {hits}")
+                    log.info(f"   {post['text'][:100]}…")
+                    send_telegram(format_alert(post, hits))
+                    new_alerts += 1
+                else:
+                    log.info(f"⏭ Skipping stale match ({post.get('date', 'no date')}): {hits}")
 
             seen.add(pid)
 
         save_seen(seen)
+        save_state(state)
 
         if new_alerts == 0:
             log.info(f"No new matches this run.")
